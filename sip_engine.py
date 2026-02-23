@@ -122,6 +122,8 @@ class AccountHandler(_account_handler_base()):
         if not pj or not self._engine:
             return
         c = CallHandler(self, prm.callId, self._engine)
+        with self._engine._lock:
+            self._engine._calls[self._engine._call_id(c)] = c
         ci = c.getInfo()
         if self._engine.on_incoming_call:
             self._engine.on_incoming_call(c, ci.remoteUri)
@@ -145,6 +147,8 @@ class SipEngine:
         self._udp_transport_id = None
         self._worker_thread = None
         self._running = False
+        self._ring_stop = False
+        self._ring_thread = None
 
     def _run_worker(self):
         """Run pj worker in this thread (must be called from a dedicated thread)."""
@@ -455,11 +459,18 @@ class SipEngine:
             return None, err
 
     def answer_call(self, call):
-        """Answer incoming call."""
+        """Answer incoming call with 200 OK. Use CallOpParam so SDP is sent correctly."""
+        if not pj or not call:
+            return
         try:
-            call.answer(200)
+            prm = pj.CallOpParam(False)
+            prm.statusCode = 200
+            call.answer(prm)
         except Exception as e:
-            sys.stderr.write("Answer error: %s\n" % e)
+            err = str(e).strip() or getattr(e, "reason", None) or repr(e)
+            sys.stderr.write("Answer error: %s\n" % err)
+            if self.on_log:
+                self.on_log("Answer error: %s" % err)
 
     def _call_id(self, call):
         try:
@@ -662,6 +673,47 @@ class SipEngine:
 
         t = threading.Thread(target=run, daemon=True)
         t.start()
+
+    def start_ring(self):
+        """Play ringtone (repeating tone) until stop_ring() is called. Safe to call if already ringing."""
+        if not pj or not self._ep:
+            return
+        if self._ring_thread is not None and self._ring_thread.is_alive():
+            return
+        self._ring_stop = False
+
+        def run():
+            import time
+            try:
+                self._ep.libRegisterThread("ring")
+                adm = self._ep.audDevManager()
+                spk = adm.getPlaybackDevMedia()
+                tonegen = pj.ToneGenerator()
+                tonegen.createToneGenerator()
+                tone = pj.ToneDesc()
+                tone.freq1 = 440
+                tone.freq2 = 0
+                tone.on_msec = 1000
+                tone.off_msec = 2000
+                tones = pj.ToneDescVector()
+                tones.append(tone)
+                tonegen.play(tones, True)
+                tonegen.startTransmit(spk)
+                while not self._ring_stop:
+                    time.sleep(0.2)
+                tonegen.stop()
+            except Exception as e:
+                if self.on_log:
+                    self.on_log("Ring error: %s" % (str(e).strip() or repr(e)))
+            finally:
+                self._ring_thread = None
+
+        self._ring_thread = threading.Thread(target=run, daemon=True)
+        self._ring_thread.start()
+
+    def stop_ring(self):
+        """Stop ringtone if playing."""
+        self._ring_stop = True
 
     def mic_test(self, duration_sec=3, on_done=None):
         """Loop mic to speaker for duration_sec. on_done() called when finished."""

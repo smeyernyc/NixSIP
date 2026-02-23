@@ -570,8 +570,8 @@ class MainWindow(Gtk.Window):
         self._setup_tray()
         if not pjsua2_available():
             self._status.set_text("pjsua2 not installed — install pjproject and Python bindings")
-            if hasattr(self, "_btn_audio"):
-                self._btn_audio.set_sensitive(False)
+            if hasattr(self, "_menu_item_audio"):
+                self._menu_item_audio.set_sensitive(False)
             return
         self._engine = SipEngine()
         self._engine.on_reg_state = _glib_idle(self._on_reg_state)
@@ -607,6 +607,17 @@ class MainWindow(Gtk.Window):
         menu_root = Gtk.MenuItem(label="Menu")
         menubar.append(menu_root)
         submenu = Gtk.Menu()
+        item_add_acc = Gtk.MenuItem(label="Add account…")
+        item_add_acc.connect("activate", self._on_add_account)
+        submenu.append(item_add_acc)
+        item_edit_acc = Gtk.MenuItem(label="Edit account…")
+        item_edit_acc.connect("activate", self._on_edit_account)
+        submenu.append(item_edit_acc)
+        item_audio = Gtk.MenuItem(label="Audio…")
+        item_audio.connect("activate", self._on_audio_options)
+        submenu.append(item_audio)
+        self._menu_item_audio = item_audio
+        submenu.append(Gtk.SeparatorMenuItem())
         item_speed_blf = Gtk.MenuItem(label="Edit speed dials & BLF…")
         item_speed_blf.connect("activate", self._on_speeddials_blf)
         submenu.append(item_speed_blf)
@@ -618,24 +629,12 @@ class MainWindow(Gtk.Window):
         submenu.append(item_sip_log)
         menu_root.set_submenu(submenu)
         box.pack_start(menubar, False, False, 0)
-        # Account row
+        # Account row (Add/Edit/Audio in Menu)
         acc_row = Gtk.Box(spacing=8)
         self._account_combo = Gtk.ComboBoxText()
         self._account_combo.connect("changed", self._on_account_changed)
         acc_row.pack_start(Gtk.Label(label="Account:"), False, False, 0)
         acc_row.pack_start(self._account_combo, True, True, 0)
-        btn_edit = Gtk.Button(label="Edit")
-        btn_edit.set_tooltip_text("Edit account")
-        btn_edit.connect("clicked", self._on_edit_account)
-        acc_row.pack_start(btn_edit, False, False, 0)
-        btn_add = Gtk.Button(label="+")
-        btn_add.set_tooltip_text("Add account")
-        btn_add.connect("clicked", self._on_add_account)
-        acc_row.pack_start(btn_add, False, False, 0)
-        self._btn_audio = Gtk.Button(label="Audio")
-        self._btn_audio.set_tooltip_text("Audio options and device test")
-        self._btn_audio.connect("clicked", self._on_audio_options)
-        acc_row.pack_start(self._btn_audio, False, False, 0)
         box.pack_start(acc_row, False, False, 0)
         # Registration indicator
         reg_row = Gtk.Box(spacing=6)
@@ -1142,6 +1141,8 @@ class MainWindow(Gtk.Window):
         self._btn_reject.set_sensitive(True)
         self._btn_call.set_sensitive(False)
         self._log("Incoming call from %s" % (remote_uri or "?"))
+        if self._engine:
+            self._engine.start_ring()
         # Bring main window to front and draw attention
         self.present()
         self.deiconify()
@@ -1154,6 +1155,11 @@ class MainWindow(Gtk.Window):
         if len(caller) > 50:
             caller = caller[:47] + "..."
         d = Gtk.Dialog(title="Incoming call", transient_for=self, modal=True)
+        d.set_destroy_with_parent(True)
+        try:
+            d.set_skip_taskbar_hint(True)
+        except Exception:
+            pass
         d.add_buttons("Reject", Gtk.ResponseType.REJECT, "Answer", Gtk.ResponseType.ACCEPT)
         d.set_default_response(Gtk.ResponseType.ACCEPT)
         box = d.get_content_area()
@@ -1161,25 +1167,34 @@ class MainWindow(Gtk.Window):
         box.add(Gtk.Label(label="Call from:", xalign=0))
         box.add(Gtk.Label(label=caller or "Unknown", xalign=0, wrap=True, selectable=True))
         d.show_all()
+        call_to_answer = None
+        accepted = False
         try:
             resp = d.run()
-            if resp == Gtk.ResponseType.ACCEPT:
-                if self._incoming_call and self._engine:
-                    self._engine.answer_call(self._incoming_call)
-                    self._current_call = self._incoming_call
-                    self._incoming_call = None
-                    self._log("Answered (from pop-up)")
-            else:
-                if self._incoming_call and self._engine:
-                    self._engine.hangup_call(self._incoming_call)
-                    self._log("Rejected (from pop-up)")
-                self._incoming_call = None
+            call_to_answer = self._incoming_call
+            accepted = resp == Gtk.ResponseType.ACCEPT
         finally:
+            if self._engine:
+                self._engine.stop_ring()
             try:
                 self.set_urgency_hint(False)
             except Exception:
                 pass
             d.destroy()
+        # Defer answer/reject to next main-loop iteration so we're not inside
+        # the dialog's nested run(); ensures 200 OK is sent reliably.
+        if call_to_answer and self._engine:
+            def do_answer_or_reject():
+                if accepted:
+                    self._engine.answer_call(call_to_answer)
+                    self._current_call = call_to_answer
+                    self._incoming_call = None
+                    self._log("Answered (from pop-up)")
+                else:
+                    self._engine.hangup_call(call_to_answer)
+                    self._log("Rejected (from pop-up)")
+                    self._incoming_call = None
+            GLib.idle_add(do_answer_or_reject)
 
     def _call_id(self, c):
         if not c or not self._engine:
@@ -1250,6 +1265,8 @@ class MainWindow(Gtk.Window):
             if not self._active_calls:
                 self._current_call = None
                 self._incoming_call = None
+                if self._engine:
+                    self._engine.stop_ring()
                 code_int = 0
                 try:
                     code_int = int(code) if code not in (None, "") else 0
@@ -1357,6 +1374,7 @@ class MainWindow(Gtk.Window):
 
     def _on_answer(self, btn):
         if self._incoming_call and self._engine:
+            self._engine.stop_ring()
             self._engine.answer_call(self._incoming_call)
             self._current_call = self._incoming_call
             self._incoming_call = None
@@ -1366,6 +1384,7 @@ class MainWindow(Gtk.Window):
 
     def _on_reject(self, btn):
         if self._incoming_call and self._engine:
+            self._engine.stop_ring()
             self._engine.hangup_call(self._incoming_call)
             self._log("Rejected")
         self._incoming_call = None
