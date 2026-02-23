@@ -1142,6 +1142,44 @@ class MainWindow(Gtk.Window):
         self._btn_reject.set_sensitive(True)
         self._btn_call.set_sensitive(False)
         self._log("Incoming call from %s" % (remote_uri or "?"))
+        # Bring main window to front and draw attention
+        self.present()
+        self.deiconify()
+        try:
+            self.set_urgency_hint(True)
+        except Exception:
+            pass
+        # Pop-up dialog to answer or reject
+        caller = (remote_uri or "Unknown").replace("sips:", "").replace("sip:", "").strip()
+        if len(caller) > 50:
+            caller = caller[:47] + "..."
+        d = Gtk.Dialog(title="Incoming call", transient_for=self, modal=True)
+        d.add_buttons("Reject", Gtk.ResponseType.REJECT, "Answer", Gtk.ResponseType.ACCEPT)
+        d.set_default_response(Gtk.ResponseType.ACCEPT)
+        box = d.get_content_area()
+        box.set_spacing(12)
+        box.add(Gtk.Label(label="Call from:", xalign=0))
+        box.add(Gtk.Label(label=caller or "Unknown", xalign=0, wrap=True, selectable=True))
+        d.show_all()
+        try:
+            resp = d.run()
+            if resp == Gtk.ResponseType.ACCEPT:
+                if self._incoming_call and self._engine:
+                    self._engine.answer_call(self._incoming_call)
+                    self._current_call = self._incoming_call
+                    self._incoming_call = None
+                    self._log("Answered (from pop-up)")
+            else:
+                if self._incoming_call and self._engine:
+                    self._engine.hangup_call(self._incoming_call)
+                    self._log("Rejected (from pop-up)")
+                self._incoming_call = None
+        finally:
+            try:
+                self.set_urgency_hint(False)
+            except Exception:
+                pass
+            d.destroy()
 
     def _call_id(self, c):
         if not c or not self._engine:
