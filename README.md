@@ -71,14 +71,15 @@ If you use the local build only (or see "pjsua2 not installed"):
 1. **+** — Add account (Display name, User ID, Domain, Password, Use TLS).
 2. Select an account from the dropdown to register.
 3. Enter a number or `sip:user@host` and click **Call** (or Enter).
-4. **Answer** / **Reject** — Incoming; **Hang up** — End current call; **Mute** — Mute mic; **Hold** — Hold/Unhold; **Transfer** — Unattended or Attended (dial then Complete transfer); **Merge** — Add another leg (three-way+).
-5. Dialpad scales with window width and keeps button aspect ratio; use it for DTMF during a call.
-6. **In-call stats** — While a call is connected, a line under the status shows call duration (e.g. 1:23), latency in ms, and MOS (Mean Opinion Score) quality estimate. Values appear after RTP is flowing; "—" is shown until data is available.
-7. **Speed dials & BLF** — Each account has its own speed dials and BLF list. Use **Menu → Edit speed dials & BLF…** to add/remove entries for the currently selected account. Speed-dial buttons and BLF row update when you switch accounts. For BLF, enter the **full SIP URI** of the extension to monitor (e.g. `sip:100@pbx.example.com`).
+4. **Answer** / **Reject** — Shown only when there is an incoming call; **Hang up** — End current call; **Mute** — Mute mic; **Hold** — Hold/Unhold (applies to the "current" leg); **Transfer** — Unattended or Attended (dial then Complete transfer); **Add call** — While in a call, add a second party (dial number; both legs stay in the call for three-way).
+5. **Three-way (Add call)** — Be on a call, click **Add call**, enter the second number. When the second party answers, both legs are active and the app mixes audio (via pjproject). The "current" call (used for Hold, Transfer, DTMF) stays the first leg; Hang up ends the current leg only.
+6. Dialpad scales with window width and keeps button aspect ratio; use it for DTMF during a call.
+7. **In-call stats** — While a call is connected, a line under the status shows call duration (e.g. 1:23), latency in ms, and MOS (Mean Opinion Score) quality estimate. Values appear after RTP is flowing; "—" is shown until data is available.
+8. **Speed dials & BLF** — Each account has its own speed dials and BLF list. Use **Menu → Edit speed dials & BLF…** to add/remove entries for the currently selected account. Speed-dial buttons and BLF row update when you switch accounts. For BLF, enter the **full SIP URI** of the extension to monitor (e.g. `sip:100@pbx.example.com`).
 
-8. **Call history** — **Menu → Call history…** opens a list of the last 20 calls (↑ outgoing, ↓ incoming). Click a row to dial that number. Shown as "No call history" when empty.
+9. **Call history** — **Menu → Call history…** opens a list of the last 20 calls (↑ outgoing, ↓ incoming). Click a row to dial that number. Shown as "No call history" when empty.
 
-**Config files:** `~/.config/sipclient/accounts.json`, `audio.json`. Speed dials and BLF are stored per account as `speeddials_<key>.json` and `blf_<key>.json` (one key per account). Call history is in `call_history.json`.
+**Config files:** `~/.config/sipclient/accounts.json`, `audio.json`, `prefs.json` (last-used account). Speed dials and BLF are stored per account as `speeddials_<key>.json` and `blf_<key>.json` (one key per account). Call history is in `call_history.json`.
 
 ## Debugging
 

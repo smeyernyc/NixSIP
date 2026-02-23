@@ -479,21 +479,45 @@ class SipEngine:
             return id(call)
 
     def hangup_call(self, call):
-        """Hang up call."""
+        """Hang up call. Safe to call if call is already disconnected; always removes from _calls."""
+        if not pj or not call:
+            return
+        cid = self._call_id(call)
         try:
-            call.hangup(pj.CallOpParam())
+            try:
+                ci = call.getInfo()
+                if ci.state in (CALL_STATE_NULL, CALL_STATE_DISCONNECTED):
+                    with self._lock:
+                        self._calls.pop(cid, None)
+                    return
+            except Exception:
+                pass
+            call.hangup(pj.CallOpParam(False))
+        except Exception as e:
+            if self.on_log:
+                self.on_log("Hangup error: %s" % (str(e).strip() or repr(e)))
+        finally:
             with self._lock:
-                self._calls.pop(self._call_id(call), None)
-        except Exception:
-            with self._lock:
-                self._calls.pop(self._call_id(call), None)
+                self._calls.pop(cid, None)
 
     def set_mute(self, call, mute):
-        """Mute/unmute call."""
+        """Mute/unmute call by connecting/disconnecting capture device to call audio media."""
+        if not pj or not self._ep or not call:
+            return
         try:
-            call.setMute(mute)
-        except Exception:
-            pass
+            aud_med = call.getAudioMedia(-1)  # -1 = first audio stream
+            cap = self._ep.audDevManager().getCaptureDevMedia()
+            if not cap or not aud_med:
+                if self.on_log:
+                    self.on_log("Mute: no capture or call audio media")
+                return
+            if mute:
+                cap.stopTransmit(aud_med)
+            else:
+                cap.startTransmit(aud_med)
+        except Exception as e:
+            if self.on_log:
+                self.on_log("Mute error: %s" % (str(e).strip() or repr(e)))
 
     def get_current_call(self):
         """Return one active/ringing call if any."""
@@ -569,9 +593,10 @@ class SipEngine:
     def unhold_call(self, call):
         """Take the call off hold (re-INVITE with UNHOLD)."""
         try:
-            prm = pj.CallOpParam(False)
-            prm.opt = pj.CallSetting(False)
-            prm.opt.flag = getattr(pj, "PJSUA_CALL_UNHOLD", 2)
+            prm = pj.CallOpParam()
+            prm.opt.audioCount = 1
+            prm.opt.videoCount = 0
+            prm.opt.flag |= getattr(pj, "PJSUA_CALL_UNHOLD", 1)
             call.reinvite(prm)
         except Exception as e:
             if self.on_log:

@@ -5,6 +5,7 @@ import os
 
 CONFIG_DIR = os.path.expanduser("~/.config/sipclient")
 ACCOUNTS_FILE = os.path.join(CONFIG_DIR, "accounts.json")
+PREFS_FILE = os.path.join(CONFIG_DIR, "prefs.json")
 
 
 def _ensure_config_dir():
@@ -89,3 +90,30 @@ def get_account(uri):
         if a.get("uri") == uri:
             return a
     return None
+
+
+def get_last_account_uri():
+    """Return the URI of the last selected account, or None."""
+    if not os.path.isfile(PREFS_FILE):
+        return None
+    try:
+        with open(PREFS_FILE, "r") as f:
+            data = json.load(f)
+        return data.get("last_account_uri")
+    except (json.JSONDecodeError, IOError):
+        return None
+
+
+def set_last_account_uri(uri):
+    """Remember the given account URI as last used."""
+    _ensure_config_dir()
+    data = {}
+    if os.path.isfile(PREFS_FILE):
+        try:
+            with open(PREFS_FILE, "r") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, IOError):
+            pass
+    data["last_account_uri"] = uri
+    with open(PREFS_FILE, "w") as f:
+        json.dump(data, f, indent=2)

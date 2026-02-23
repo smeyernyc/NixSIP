@@ -24,7 +24,7 @@ try:
 except ImportError:
     cairo = None
 
-from accounts import load_accounts, save_accounts, account_label, add_account, update_account, CONFIG_DIR
+from accounts import load_accounts, save_accounts, account_label, add_account, update_account, CONFIG_DIR, get_last_account_uri, set_last_account_uri
 from audio_config import load_audio_settings, save_audio_settings
 from sip_engine import SipEngine, pjsua2_available
 from speeddials_blf import load_speeddials, save_speeddials, load_blf, save_blf, set_blf_debug_log
@@ -553,12 +553,13 @@ class MainWindow(Gtk.Window):
         self._engine = None
         self._indicator = None
         self._status_icon = None  # fallback tray when AppIndicator not available
-        self._current_call = None
+        self._current_call = None   # "focused" call: Hold/Transfer/DTMF apply to this one; in 3-way stays as first leg
         self._incoming_call = None
         self._call_start_time = None  # time when current call became CONFIRMED (for timer)
         self._call_stats_timeout_id = None  # GLib timeout for call stats refresh
-        self._active_calls = []  # list of active (non-disconnected) calls for merge/transfer
+        self._active_calls = []  # all active (non-disconnected) legs; used for 3-way, transfer, and Add call button
         self._held_calls = set()  # call ids on hold
+        self._established_call_ids = set()  # call ids in CONFIRMED / media active (Hold and Add call only then)
         self._attended_transfer_original = None  # for attended transfer: first call
         self._audio_dialog = None
         self._muted = False
@@ -667,27 +668,27 @@ class MainWindow(Gtk.Window):
         self._btn_call.connect("clicked", lambda b: self._do_call())
         dial_row.pack_start(self._btn_call, False, False, 0)
         box.pack_start(dial_row, False, False, 0)
+        # Call controls: only visible when there is an active or incoming call
+        self._call_ctrl_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         self._btn_hangup = Gtk.Button(label="Hang up")
         self._btn_hangup.connect("clicked", self._on_hangup)
         self._btn_hangup.set_sensitive(False)
-        box.pack_start(self._btn_hangup, False, False, 0)
-        # Answer / Reject (for incoming)
-        inc_row = Gtk.Box(spacing=8)
+        self._call_ctrl_box.pack_start(self._btn_hangup, False, False, 0)
+        # Answer / Reject (only visible when there is an incoming call)
+        self._inc_row = Gtk.Box(spacing=8)
         self._btn_answer = Gtk.Button(label="Answer")
         self._btn_answer.connect("clicked", self._on_answer)
-        self._btn_answer.set_sensitive(False)
         self._btn_reject = Gtk.Button(label="Reject")
         self._btn_reject.connect("clicked", self._on_reject)
-        self._btn_reject.set_sensitive(False)
-        inc_row.pack_start(self._btn_answer, True, True, 0)
-        inc_row.pack_start(self._btn_reject, True, True, 0)
-        box.pack_start(inc_row, False, False, 0)
+        self._inc_row.pack_start(self._btn_answer, True, True, 0)
+        self._inc_row.pack_start(self._btn_reject, True, True, 0)
+        self._call_ctrl_box.pack_start(self._inc_row, False, False, 0)
         # Mute
         self._btn_mute = Gtk.ToggleButton(label="Mute")
         self._btn_mute.connect("toggled", self._on_mute_toggled)
         self._btn_mute.set_sensitive(False)
-        box.pack_start(self._btn_mute, False, False, 0)
-        # Hold / Transfer / Merge
+        self._call_ctrl_box.pack_start(self._btn_mute, False, False, 0)
+        # Hold / Transfer / Add call / Complete transfer
         ctrl_row = Gtk.Box(spacing=8)
         self._btn_hold = Gtk.ToggleButton(label="Hold")
         self._btn_hold.connect("toggled", self._on_hold_toggled)
@@ -697,15 +698,23 @@ class MainWindow(Gtk.Window):
         self._btn_transfer.connect("clicked", self._on_transfer)
         self._btn_transfer.set_sensitive(False)
         ctrl_row.pack_start(self._btn_transfer, False, False, 0)
-        self._btn_merge = Gtk.Button(label="Merge")
+        self._btn_merge = Gtk.Button(label="Add call")
+        self._btn_merge.set_tooltip_text("Add another party — dial a second number; current call goes on hold")
         self._btn_merge.connect("clicked", self._on_merge)
         self._btn_merge.set_sensitive(False)
         ctrl_row.pack_start(self._btn_merge, False, False, 0)
+        self._btn_merge_calls = Gtk.Button(label="Merge")
+        self._btn_merge_calls.set_tooltip_text("Unhold the other call so everyone is in the same conversation")
+        self._btn_merge_calls.connect("clicked", self._on_merge_calls)
+        self._btn_merge_calls.set_sensitive(False)
+        ctrl_row.pack_start(self._btn_merge_calls, False, False, 0)
         self._btn_complete_transfer = Gtk.Button(label="Complete transfer")
         self._btn_complete_transfer.connect("clicked", self._on_complete_transfer)
         self._btn_complete_transfer.set_sensitive(False)
         ctrl_row.pack_start(self._btn_complete_transfer, False, False, 0)
-        box.pack_start(ctrl_row, False, False, 0)
+        self._call_ctrl_box.pack_start(ctrl_row, False, False, 0)
+        box.pack_start(self._call_ctrl_box, False, False, 0)
+        self._call_ctrl_box.set_visible(False)
         # Dialpad: scale to width, keep 3:4 aspect ratio (3 columns, 4 rows)
         dialpad = Gtk.Grid(column_spacing=4, row_spacing=4)
         keys = [
@@ -810,13 +819,34 @@ class MainWindow(Gtk.Window):
         except Exception:
             return ""
 
+    def _update_call_ctrl_visibility(self):
+        """Show call-control block (Hang up, Answer/Reject, Mute, Hold, etc.) only when there is an active or incoming call."""
+        has_call = bool(self._current_call) or len(self._active_calls) >= 1 or bool(self._incoming_call)
+        self._call_ctrl_box.set_visible(has_call)
+
+    def _update_incoming_buttons(self):
+        """Show Answer/Reject row only when there is an incoming call to answer."""
+        has_incoming = bool(self._incoming_call)
+        self._inc_row.set_visible(has_incoming)
+        self._btn_answer.set_sensitive(has_incoming)
+        self._btn_reject.set_sensitive(has_incoming)
+        self._update_call_ctrl_visibility()
+
     def _update_call_buttons(self):
+        # _current_call = the "focused" call (Hold/Transfer/DTMF apply to it). In 3-way we keep it as the first call.
         has_current = bool(self._current_call)
+        has_established_current = has_current and self._call_id(self._current_call) in self._established_call_ids
+        has_any_established = has_established_current or any(self._call_id(c) in self._established_call_ids for c in self._active_calls)
         self._btn_hangup.set_sensitive(has_current)
         self._btn_mute.set_sensitive(has_current)
-        self._btn_hold.set_sensitive(has_current)
-        self._btn_transfer.set_sensitive(has_current)
-        self._btn_merge.set_sensitive(len(self._active_calls) >= 1)
+        self._btn_hold.set_sensitive(has_established_current)
+        self._btn_transfer.set_sensitive(has_established_current)
+        self._btn_merge.set_sensitive(has_any_established)
+        can_merge = (
+            len(self._active_calls) == 2
+            and any(self._call_id(c) in self._held_calls for c in self._active_calls)
+        )
+        self._btn_merge_calls.set_sensitive(can_merge)
         can_complete = (
             self._attended_transfer_original is not None
             and len(self._active_calls) == 2
@@ -826,8 +856,13 @@ class MainWindow(Gtk.Window):
         self._btn_complete_transfer.set_visible(can_complete)
         if has_current and self._call_id(self._current_call) in self._held_calls:
             self._btn_hold.set_active(True)
+            self._btn_hold.set_label("Resume")
         elif has_current:
             self._btn_hold.set_active(False)
+            self._btn_hold.set_label("Hold")
+        else:
+            self._btn_hold.set_label("Hold")
+        self._update_call_ctrl_visibility()
 
     def _refresh_account_combo(self):
         self._accounts = load_accounts()
@@ -836,7 +871,14 @@ class MainWindow(Gtk.Window):
         for a in self._accounts:
             combo.append(account_label(a), account_label(a))
         if self._accounts:
-            combo.set_active(0)
+            last_uri = get_last_account_uri()
+            idx = 0
+            if last_uri:
+                for i, a in enumerate(self._accounts):
+                    if a.get("uri") == last_uri:
+                        idx = i
+                        break
+            combo.set_active(idx)
 
     def _on_add_account(self, btn):
         d = AccountDialog(self)
@@ -1095,6 +1137,8 @@ class MainWindow(Gtk.Window):
 
     def _on_account_changed(self, _):
         acc = self._get_selected_account()
+        if acc:
+            set_last_account_uri(acc.get("uri"))
         self._reg_uri_label.set_text(acc.get("uri", "") if acc else "")
         self._refresh_speeddials_blf()  # load this account's speed dials and BLF
         if not acc or not self._engine:
@@ -1136,9 +1180,8 @@ class MainWindow(Gtk.Window):
         if remote_uri:
             add_entry(remote_uri, "in")
         self._incoming_call = call
+        self._update_incoming_buttons()
         self._status.set_text("Incoming: %s" % (remote_uri or "?"))
-        self._btn_answer.set_sensitive(True)
-        self._btn_reject.set_sensitive(True)
         self._btn_call.set_sensitive(False)
         self._log("Incoming call from %s" % (remote_uri or "?"))
         if self._engine:
@@ -1189,11 +1232,14 @@ class MainWindow(Gtk.Window):
                     self._engine.answer_call(call_to_answer)
                     self._current_call = call_to_answer
                     self._incoming_call = None
+                    self._update_incoming_buttons()
+                    self._update_call_buttons()
                     self._log("Answered (from pop-up)")
                 else:
                     self._engine.hangup_call(call_to_answer)
                     self._log("Rejected (from pop-up)")
                     self._incoming_call = None
+                    self._update_incoming_buttons()
             GLib.idle_add(do_answer_or_reject)
 
     def _call_id(self, c):
@@ -1233,9 +1279,13 @@ class MainWindow(Gtk.Window):
         if not call or not self._engine:
             return
         cid = self._call_id(call)
+        self._established_call_ids.add(cid)
         if call not in self._active_calls:
             self._active_calls.append(call)
-        self._current_call = call
+        # Only set _current_call if we don't have one yet or this is the same call (don't steal when 2nd leg in 3-way)
+        if self._current_call is None or self._call_id(self._current_call) == cid:
+            self._current_call = call
+        self._update_call_buttons()
         self._status.set_text("In call: %s" % (remote_uri or "") + (" (%s calls)" % len(self._active_calls) if len(self._active_calls) > 1 else ""))
         if self._call_start_time is None:
             self._call_start_time = time.time()
@@ -1255,6 +1305,7 @@ class MainWindow(Gtk.Window):
         if state in (CALL_STATE_NULL, CALL_STATE_DISCONNECTED):
             self._active_calls = [c for c in self._active_calls if self._call_id(c) != cid]
             self._held_calls.discard(cid)
+            self._established_call_ids.discard(cid)
             if self._attended_transfer_original and self._call_id(self._attended_transfer_original) == cid:
                 self._attended_transfer_original = None
             if self._current_call and self._call_id(self._current_call) == cid:
@@ -1265,6 +1316,7 @@ class MainWindow(Gtk.Window):
             if not self._active_calls:
                 self._current_call = None
                 self._incoming_call = None
+                self._update_incoming_buttons()
                 if self._engine:
                     self._engine.stop_ring()
                 code_int = 0
@@ -1283,12 +1335,11 @@ class MainWindow(Gtk.Window):
                 self._btn_hold.set_sensitive(False)
                 self._btn_transfer.set_sensitive(False)
                 self._btn_merge.set_sensitive(False)
+                self._btn_merge_calls.set_sensitive(False)
                 self._btn_complete_transfer.set_sensitive(False)
                 self._btn_complete_transfer.set_visible(False)
                 self._btn_mute.set_active(False)
                 self._muted = False
-                self._btn_answer.set_sensitive(False)
-                self._btn_reject.set_sensitive(False)
                 self._btn_call.set_sensitive(True)
                 self._call_start_time = None
                 self._stop_call_stats_timer()
@@ -1300,12 +1351,22 @@ class MainWindow(Gtk.Window):
             if state in (CALL_STATE_CONNECTING, CALL_STATE_CONFIRMED) and call not in self._active_calls:
                 self._active_calls.append(call)
             if state == CALL_STATE_CONFIRMED:
-                self._current_call = call  # ensure we track the confirmed call
-            self._btn_hangup.set_sensitive(True)
-            self._btn_mute.set_sensitive(True)
-            self._btn_hold.set_sensitive(bool(self._current_call))
-            self._btn_transfer.set_sensitive(bool(self._current_call))
-            self._btn_merge.set_sensitive(len(self._active_calls) >= 1)
+                self._established_call_ids.add(cid)
+                # Only set _current_call if we don't have one yet or this is the same call (don't steal when 2nd leg connects in 3-way)
+                if self._current_call is None or self._call_id(self._current_call) == cid:
+                    self._current_call = call
+            self._btn_hangup.set_sensitive(bool(self._current_call))
+            self._btn_mute.set_sensitive(bool(self._current_call))
+            has_established_current = bool(self._current_call) and self._call_id(self._current_call) in self._established_call_ids
+            has_any_established = has_established_current or any(self._call_id(c) in self._established_call_ids for c in self._active_calls)
+            self._btn_hold.set_sensitive(has_established_current)
+            self._btn_transfer.set_sensitive(has_established_current)
+            self._btn_merge.set_sensitive(has_any_established)
+            can_merge = (
+                len(self._active_calls) == 2
+                and any(self._call_id(c) in self._held_calls for c in self._active_calls)
+            )
+            self._btn_merge_calls.set_sensitive(can_merge)
             can_complete = (
                 self._attended_transfer_original is not None
                 and len(self._active_calls) == 2
@@ -1314,10 +1375,14 @@ class MainWindow(Gtk.Window):
             self._btn_complete_transfer.set_sensitive(can_complete)
             self._btn_complete_transfer.set_visible(can_complete)
             if state == CALL_STATE_CONFIRMED:
-                self._status.set_text("In call: %s" % (remote_uri or "") + (" (%s calls)" % len(self._active_calls) if len(self._active_calls) > 1 else ""))
-                self._btn_answer.set_sensitive(False)
-                self._btn_reject.set_sensitive(False)
-                self._btn_hold.set_active(cid in self._held_calls)
+                status = "In call: %s" % (remote_uri or "") + (" (%s calls)" % len(self._active_calls) if len(self._active_calls) > 1 else "")
+                if self._held_calls:
+                    status += " — %s on hold" % len(self._held_calls)
+                self._status.set_text(status)
+                self._update_incoming_buttons()
+                on_hold = cid in self._held_calls
+                self._btn_hold.set_active(on_hold)
+                self._btn_hold.set_label("Resume" if on_hold else "Hold")
                 self._call_start_time = time.time()
                 self._start_call_stats_timer()
             elif state == CALL_STATE_INCOMING:
@@ -1351,9 +1416,8 @@ class MainWindow(Gtk.Window):
             call, err = self._engine.make_call(to)
             if call is not None:
                 self._current_call = call
+                self._update_call_buttons()
                 self._btn_call.set_sensitive(False)
-                self._btn_hangup.set_sensitive(True)
-                self._btn_mute.set_sensitive(True)
                 self._status.set_text("Calling %s…" % to)
                 self._log("Call started to %s" % to)
             else:
@@ -1363,14 +1427,33 @@ class MainWindow(Gtk.Window):
             self._status.set_text("Call error: %s" % str(e))
             self._log("Call exception: %s" % str(e))
 
+    def _remove_call_from_ui(self, call):
+        """Remove a call from UI state (e.g. after hangup). Idempotent with _on_call_state DISCONNECTED."""
+        if not call:
+            return
+        cid = self._call_id(call)
+        if self._incoming_call and self._call_id(self._incoming_call) == cid:
+            self._incoming_call = None
+        self._active_calls = [c for c in self._active_calls if self._call_id(c) != cid]
+        self._held_calls.discard(cid)
+        self._established_call_ids.discard(cid)
+        if self._current_call and self._call_id(self._current_call) == cid:
+            self._current_call = self._active_calls[0] if self._active_calls else None
+            if not self._current_call:
+                self._call_start_time = None
+                self._stop_call_stats_timer()
+                self._call_stats_label.set_text("")
+                if not self._active_calls and not self._incoming_call:
+                    self._status.set_text("Ready" if self._get_selected_account() else "No account")
+        self._update_incoming_buttons()
+        self._update_call_buttons()
+
     def _on_hangup(self, btn):
         call = self._current_call or self._incoming_call
         if call and self._engine:
             self._engine.hangup_call(call)
             self._log("Hangup")
-        if call == self._incoming_call:
-            self._incoming_call = None
-        # _current_call and _active_calls are updated in _on_call_state when we get DISCONNECTED
+            self._remove_call_from_ui(call)
 
     def _on_answer(self, btn):
         if self._incoming_call and self._engine:
@@ -1378,9 +1461,9 @@ class MainWindow(Gtk.Window):
             self._engine.answer_call(self._incoming_call)
             self._current_call = self._incoming_call
             self._incoming_call = None
+            self._update_incoming_buttons()
+            self._update_call_buttons()
             self._log("Answered")
-        self._btn_answer.set_sensitive(False)
-        self._btn_reject.set_sensitive(False)
 
     def _on_reject(self, btn):
         if self._incoming_call and self._engine:
@@ -1388,8 +1471,7 @@ class MainWindow(Gtk.Window):
             self._engine.hangup_call(self._incoming_call)
             self._log("Rejected")
         self._incoming_call = None
-        self._btn_answer.set_sensitive(False)
-        self._btn_reject.set_sensitive(False)
+        self._update_incoming_buttons()
 
     def _on_mute_toggled(self, btn):
         self._muted = btn.get_active()
@@ -1407,11 +1489,19 @@ class MainWindow(Gtk.Window):
         if hold:
             self._engine.hold_call(call)
             self._held_calls.add(cid)
+            btn.set_label("Resume")
             self._log("Hold")
         else:
             self._engine.unhold_call(call)
             self._held_calls.discard(cid)
+            btn.set_label("Hold")
             self._log("Unhold")
+        self._update_call_buttons()
+        if self._current_call and len(self._active_calls) >= 1:
+            status = "In call: %s" % (self._current_call_remote() or "") + (" (%s calls)" % len(self._active_calls) if len(self._active_calls) > 1 else "")
+            if self._held_calls:
+                status += " — %s on hold" % len(self._held_calls)
+            self._status.set_text(status)
 
     def _normalize_dest(self, to):
         """Return sip/sips URI for destination (add scheme and domain if needed)."""
@@ -1484,15 +1574,34 @@ class MainWindow(Gtk.Window):
         else:
             self._log("Attended transfer completed")
 
+    def _on_merge_calls(self, btn):
+        """Unhold all held calls so both legs are active (local 3-way: everyone hears everyone)."""
+        if not self._engine or len(self._active_calls) < 2:
+            return
+        for call in self._active_calls:
+            cid = self._call_id(call)
+            if cid in self._held_calls:
+                self._engine.unhold_call(call)
+                self._held_calls.discard(cid)
+                try:
+                    uri = getattr(call.getInfo(), "remoteUri", "") or ""
+                except Exception:
+                    uri = ""
+                self._log("Unhold for merge: %s" % (uri or cid))
+        self._btn_hold.set_active(False)
+        self._update_call_buttons()
+        self._status.set_text("In call: 2 parties" + (" (%s)" % (self._current_call_remote() or "")))
+        self._log("Merge: both calls active")
+
     def _on_merge(self, btn):
         if not self._engine or not self._get_selected_account():
             return
-        d = Gtk.Dialog(title="Merge (add call)", transient_for=self, modal=True)
+        d = Gtk.Dialog(title="Add call", transient_for=self, modal=True)
         d.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, Gtk.STOCK_OK, Gtk.ResponseType.OK)
         d.set_default_size(320, 100)
         box = d.get_content_area()
         box.set_spacing(8)
-        box.add(Gtk.Label(label="Number or URI to add:"))
+        box.add(Gtk.Label(label="Number or SIP URI to call (current call will be put on hold):"))
         entry = Gtk.Entry()
         entry.set_placeholder_text("Number or sip:user@host")
         box.add(entry)
@@ -1504,9 +1613,17 @@ class MainWindow(Gtk.Window):
         d.destroy()
         if not to:
             return
+        # Put current call on hold before placing the new call (track in _held_calls so Merge appears)
+        if self._current_call and self._engine:
+            held_cid = self._call_id(self._current_call)
+            self._engine.hold_call(self._current_call)
+            self._held_calls.add(held_cid)
+            self._log("Current call on hold while adding call")
         try:
             call, err = self._engine.make_call(to)
             if call is not None:
+                self._current_call = call  # focus new leg so Hang up cancels this call, not the one on hold
+                self._update_call_buttons()
                 self._log("Merge: calling %s" % to)
                 self._status.set_text("Calling %s… (merge)" % to)
             else:
@@ -1612,6 +1729,9 @@ def main():
                 pass
     win = MainWindow()
     win.show_all()
+    # Re-apply visibility so call controls stay hidden when idle (show_all() makes everything visible)
+    win._update_incoming_buttons()
+    win._update_call_buttons()
     Gtk.main()
 
 
