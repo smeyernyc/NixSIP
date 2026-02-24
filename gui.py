@@ -1005,12 +1005,18 @@ class MainWindow(Gtk.Window):
                     ev.get_style_context().add_class("blf-clickable")
                 except Exception:
                     pass
-                self._blf_box.pack_start(ev, False, False, 0)
+                blf_frame = Gtk.Frame()
+                blf_frame.set_shadow_type(Gtk.ShadowType.ETCHED_IN)
+                blf_frame.add(ev)
+                self._blf_box.pack_start(blf_frame, False, False, 0)
                 self._blf_indicators[uri] = indicator
             else:
                 self._blf_box.pack_start(h, False, False, 0)
         if self._engine and blf_entries:
-            self._engine.set_blf(blf_entries)
+            try:
+                self._engine.set_blf(blf_entries)
+            except Exception as e:
+                self._log("BLF subscribe error: %s" % (e,))
         if blf_entries:
             self._log("BLF: %d entries: %s" % (len(blf_entries), ", ".join(
                 "%s (%s)" % (x.get("label") or "?", x.get("uri") or "?") for x in blf_entries)))
@@ -1073,32 +1079,39 @@ class MainWindow(Gtk.Window):
 
     def _on_blf_state(self, uri, state_str):
         """Update BLF indicator for the given URI (green dot / green flash / red)."""
-        if getattr(self, "_blf_indicators", None) and uri not in self._blf_indicators:
-            return
-        if uri not in self._blf_indicators:
-            return
-        ind = self._blf_indicators[uri]
-        raw = (state_str or "").strip()
-        # Map to display state: idle -> green dot, ringing -> green flash, busy -> red
-        if not raw or raw in ("?", "Active", "Pending"):
-            state = "idle"
-        else:
-            raw_lower = raw.lower()
-            if raw_lower in ("terminated", "idle", "init"):
+        try:
+            if not getattr(self, "_blf_indicators", None) or uri not in self._blf_indicators:
+                return
+            ind = self._blf_indicators[uri]
+            raw = (state_str or "").strip()
+            # Map to display state: idle -> green dot, ringing -> green flash, busy -> red
+            # Use dialog_state only: confirmed=busy, terminated/idle/partial=idle, trying/early/proceeding=ringing.
+            # Do not treat "full" as busy — it means "full snapshot" (document state), not "line in call".
+            if not raw or raw in ("?", "Active", "Pending", "full", "Full"):
                 state = "idle"
-            elif raw_lower in ("trying", "early", "proceeding"):
-                state = "ringing"
-            elif raw_lower in ("confirmed", "active"):
-                state = "busy"
             else:
-                state = "idle"
-        if isinstance(ind, BLFIndicator):
-            ind.set_state(state)
-        else:
-            # fallback text when cairo not available
-            text = {"idle": "—", "ringing": "…", "busy": "●"}.get(state, "—")
-            if ind.get_label() != text:
-                ind.set_text(text)
+                raw_lower = raw.lower()
+                if raw_lower in ("terminated", "idle", "init", "partial"):
+                    state = "idle"
+                elif raw_lower in ("trying", "early", "proceeding"):
+                    state = "ringing"
+                elif raw_lower in ("confirmed", "active"):
+                    state = "busy"
+                else:
+                    state = "idle"
+            if isinstance(ind, BLFIndicator):
+                ind.set_state(state)
+            else:
+                # fallback text when cairo not available
+                text = {"idle": "—", "ringing": "…", "busy": "●"}.get(state, "—")
+                if ind.get_label() != text:
+                    ind.set_text(text)
+        except Exception as e:
+            if getattr(self, "_log", None):
+                try:
+                    self._log("BLF state update error: %s" % (e,))
+                except Exception:
+                    pass
 
     def _on_speeddials_blf(self, menuitem=None):
         acc = self._get_selected_account()
@@ -1168,79 +1181,118 @@ class MainWindow(Gtk.Window):
             self._log("Registration OK: %s" % (uri or label))
             # Apply BLF subscriptions for this account now that we're registered
             if self._engine:
-                acc = self._get_selected_account()
-                account_uri = acc.get("uri") if acc else None
-                self._engine.set_blf(load_blf(account_uri))
+                try:
+                    acc = self._get_selected_account()
+                    account_uri = acc.get("uri") if acc else None
+                    self._engine.set_blf(load_blf(account_uri))
+                except Exception as e:
+                    self._log("BLF subscribe (on register) error: %s" % (e,))
         else:
             self._reg_indicator.set_markup('<span size="small" color="darkred">○ Not registered</span>')
             self._status.set_text("Registration failed: %s" % (uri or "Unknown error"))
             self._log("Registration failed: %s" % (uri or "Unknown error"))
 
     def _on_incoming_call(self, call, remote_uri):
-        if remote_uri:
-            add_entry(remote_uri, "in")
-        self._incoming_call = call
-        self._update_incoming_buttons()
-        self._status.set_text("Incoming: %s" % (remote_uri or "?"))
-        self._btn_call.set_sensitive(False)
-        self._log("Incoming call from %s" % (remote_uri or "?"))
-        if self._engine:
-            self._engine.start_ring()
-        # Bring main window to front and draw attention
-        self.present()
-        self.deiconify()
-        try:
-            self.set_urgency_hint(True)
-        except Exception:
-            pass
-        # Pop-up dialog to answer or reject
-        caller = (remote_uri or "Unknown").replace("sips:", "").replace("sip:", "").strip()
-        if len(caller) > 50:
-            caller = caller[:47] + "..."
-        d = Gtk.Dialog(title="Incoming call", transient_for=self, modal=True)
-        d.set_destroy_with_parent(True)
-        try:
-            d.set_skip_taskbar_hint(True)
-        except Exception:
-            pass
-        d.add_buttons("Reject", Gtk.ResponseType.REJECT, "Answer", Gtk.ResponseType.ACCEPT)
-        d.set_default_response(Gtk.ResponseType.ACCEPT)
-        box = d.get_content_area()
-        box.set_spacing(12)
-        box.add(Gtk.Label(label="Call from:", xalign=0))
-        box.add(Gtk.Label(label=caller or "Unknown", xalign=0, wrap=True, selectable=True))
-        d.show_all()
-        call_to_answer = None
-        accepted = False
-        try:
-            resp = d.run()
-            call_to_answer = self._incoming_call
-            accepted = resp == Gtk.ResponseType.ACCEPT
-        finally:
+        def _clear_incoming():
+            self._incoming_call = None
+            self._update_incoming_buttons()
             if self._engine:
                 self._engine.stop_ring()
+            self._btn_call.set_sensitive(True)
+
+        try:
+            if not call:
+                self._log("Incoming call ignored (no call object)")
+                return
+            if remote_uri:
+                try:
+                    add_entry(remote_uri, "in")
+                except Exception:
+                    pass
+            self._incoming_call = call
+            self._update_incoming_buttons()
+            self._status.set_text("Incoming: %s" % (remote_uri or "?"))
+            self._btn_call.set_sensitive(False)
+            self._log("Incoming call from %s" % (remote_uri or "?"))
+            if self._engine:
+                self._engine.start_ring()
+            # Bring main window to front and draw attention
+            self.present()
+            self.deiconify()
             try:
-                self.set_urgency_hint(False)
+                self.set_urgency_hint(True)
             except Exception:
                 pass
-            d.destroy()
-        # Defer answer/reject to next main-loop iteration so we're not inside
-        # the dialog's nested run(); ensures 200 OK is sent reliably.
-        if call_to_answer and self._engine:
-            def do_answer_or_reject():
-                if accepted:
-                    self._engine.answer_call(call_to_answer)
-                    self._current_call = call_to_answer
-                    self._incoming_call = None
-                    self._update_incoming_buttons()
-                    self._update_call_buttons()
-                    self._log("Answered (from pop-up)")
-                else:
-                    self._engine.hangup_call(call_to_answer)
-                    self._log("Rejected (from pop-up)")
-                    self._incoming_call = None
-                    self._update_incoming_buttons()
-            GLib.idle_add(do_answer_or_reject)
+            # Pop-up dialog to answer or reject
+            caller = (remote_uri or "Unknown").replace("sips:", "").replace("sip:", "").strip()
+            if len(caller) > 50:
+                caller = caller[:47] + "..."
+            d = Gtk.Dialog(title="Incoming call", transient_for=self, modal=True)
+            d.set_destroy_with_parent(True)
+            try:
+                d.set_skip_taskbar_hint(True)
+            except Exception:
+                pass
+            d.add_buttons("Reject", Gtk.ResponseType.REJECT, "Answer", Gtk.ResponseType.ACCEPT)
+            d.set_default_response(Gtk.ResponseType.ACCEPT)
+            box = d.get_content_area()
+            box.set_spacing(12)
+            box.add(Gtk.Label(label="Call from:", xalign=0))
+            box.add(Gtk.Label(label=caller or "Unknown", xalign=0, wrap=True, selectable=True))
+            d.show_all()
+            call_to_answer = None
+            accepted = False
+            try:
+                resp = d.run()
+                call_to_answer = self._incoming_call
+                accepted = resp == Gtk.ResponseType.ACCEPT
+            finally:
+                if self._engine:
+                    self._engine.stop_ring()
+                try:
+                    self.set_urgency_hint(False)
+                except Exception:
+                    pass
+                try:
+                    d.destroy()
+                except Exception:
+                    pass
+            # Defer answer/reject to next main-loop iteration so we're not inside
+            # the dialog's nested run(); ensures 200 OK is sent reliably.
+            if call_to_answer and self._engine:
+                def do_answer_or_reject():
+                    try:
+                        # Skip if call no longer in engine (e.g. caller hung up)
+                        with self._engine._lock:
+                            cid = self._engine._call_id(call_to_answer)
+                            if cid not in self._engine._calls:
+                                self._log("Incoming call already ended (ignored)")
+                                _clear_incoming()
+                                return
+                        if accepted:
+                            self._engine.answer_call(call_to_answer)
+                            self._current_call = call_to_answer
+                            self._incoming_call = None
+                            self._update_incoming_buttons()
+                            self._update_call_buttons()
+                            self._log("Answered (from pop-up)")
+                        else:
+                            self._engine.hangup_call(call_to_answer)
+                            self._log("Rejected (from pop-up)")
+                            self._incoming_call = None
+                            self._update_incoming_buttons()
+                    except Exception as e:
+                        self._log("Answer/reject error: %s" % (e,))
+                        _clear_incoming()
+                        self._btn_call.set_sensitive(True)
+                GLib.idle_add(do_answer_or_reject)
+            else:
+                _clear_incoming()
+        except Exception as e:
+            self._log("Incoming call error: %s" % (e,))
+            _clear_incoming()
+            self._btn_call.set_sensitive(True)
+            self._status.set_text("Ready" if self._get_selected_account() else "No account")
 
     def _call_id(self, c):
         if not c or not self._engine:

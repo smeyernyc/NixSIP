@@ -3,6 +3,8 @@
 import os
 import sys
 import threading
+import time
+import ctypes
 
 # Call state constants (PJSIP_INV_STATE_*)
 CALL_STATE_NULL = 0
@@ -31,45 +33,13 @@ def _account_handler_base():
     return pj.Account if pj else object
 
 
-def _buddy_handler_base():
-    return pj.Buddy if pj else object
-
-
-class BLFBuddyHandler(_buddy_handler_base()):
-    """Buddy for BLF (dialog event) subscription; notifies engine on state change."""
-
-    def __init__(self, engine=None, blf_uri=""):
-        if pj:
-            pj.Buddy.__init__(self)
-        self._engine = engine
-        self._blf_uri = blf_uri
-
-    def _report_state(self):
-        if not pj or not self._engine or not self._engine.on_blf_state:
-            return
-        try:
-            info = self.getInfo()
-            state_str = ""
-            if info and getattr(info, "presStatus", None):
-                ps = info.presStatus
-                state_str = (getattr(ps, "statusText", None) or getattr(ps, "note", None) or "").strip()
-            if not state_str:
-                state_str = getattr(info, "subStateName", None) or ""
-            state_str = state_str.strip()
-            # Subscription state (Active, Pending) or "?" is not dialog state; show as idle/unknown
-            if state_str in ("?", "Active", "Pending", "Terminated", ""):
-                state_str = "—"
-            if self._engine.on_log:
-                self._engine.on_log("BLF state %s: %s" % (self._blf_uri, state_str))
-            self._engine.on_blf_state(self._blf_uri, state_str)
-        except Exception:
-            pass
-
-    def onBuddyDlgEventState(self):
-        self._report_state()
-
-    def onBuddyEvSubDlgEventState(self, prm):
-        self._report_state()
+# BLF: handler and processing live in blf.py
+try:
+    from blf import BLFBuddyHandler, process_blf_pending, refresh_blf_from_log
+except ImportError:
+    BLFBuddyHandler = None
+    process_blf_pending = None
+    refresh_blf_from_log = None
 
 
 class CallHandler(_call_handler_base()):
@@ -121,12 +91,22 @@ class AccountHandler(_account_handler_base()):
     def onIncomingCall(self, prm):
         if not pj or not self._engine:
             return
-        c = CallHandler(self, prm.callId, self._engine)
-        with self._engine._lock:
-            self._engine._calls[self._engine._call_id(c)] = c
-        ci = c.getInfo()
-        if self._engine.on_incoming_call:
-            self._engine.on_incoming_call(c, ci.remoteUri)
+        try:
+            c = CallHandler(self, prm.callId, self._engine)
+            with self._engine._lock:
+                self._engine._calls[self._engine._call_id(c)] = c
+            try:
+                ci = c.getInfo()
+                remote_uri = getattr(ci, "remoteUri", None) if ci else None
+            except Exception:
+                remote_uri = None
+            if self._engine.on_incoming_call:
+                try:
+                    self._engine.on_incoming_call(c, remote_uri)
+                except Exception as e:
+                    sys.stderr.write("on_incoming_call error: %s\n" % (e,))
+        except Exception as e:
+            sys.stderr.write("onIncomingCall error: %s\n" % (e,))
 
 
 class SipEngine:
@@ -137,6 +117,8 @@ class SipEngine:
         self._accounts = {}  # uri -> (AccountHandler, AccountConfig)
         self._calls = {}  # call_id -> CallHandler
         self._blf_buddies = []  # list of BLFBuddyHandler (keep refs so not GC'd)
+        self._blf_pending_refresh = []  # (buddy_id, uri, timestamp); blf.process_blf_pending drains after delay
+        self._blf_pending_lock = threading.Lock()
         self._lock = threading.Lock()
         self.on_reg_state = None
         self.on_incoming_call = None
@@ -200,7 +182,7 @@ class SipEngine:
         except Exception:
             pass
         if getattr(self, "_sip_log_path", None) and self.on_log:
-            self.on_log("SIP/RTP debug log: %s" % self._sip_log_path)
+            self.on_log("SIP messages logged to file (Help > Open SIP debug log): %s" % self._sip_log_path)
         # If no audio devices at all, use null device so calls don't fail
         try:
             adm = self._ep.audDevManager()
@@ -240,8 +222,17 @@ class SipEngine:
                     self._ep.libHandleEvents(10)  # 10ms timeout
             except Exception:
                 break
-            import time
-            time.sleep(0.01)  # Small sleep to avoid busy-wait
+            if process_blf_pending:
+                try:
+                    process_blf_pending(self)
+                except Exception:
+                    pass
+            if refresh_blf_from_log:
+                try:
+                    refresh_blf_from_log(self)
+                except Exception:
+                    pass
+            time.sleep(0.01)
 
     def _connect_slots(self, aud_med):
         """Connect call audio to sound device. Must succeed or the call may drop when answered."""
@@ -402,29 +393,54 @@ class SipEngine:
         """
         if not pj:
             return
-        with self._lock:
-            self._blf_buddies.clear()
-            if not self._accounts:
-                return
-            acc = list(self._accounts.values())[0][0]
-        for e in entries:
-            uri = (e.get("uri") or "").strip()
-            if not uri:
-                continue
-            try:
-                cfg = pj.BuddyConfig()
-                cfg.uri = uri
-                cfg.subscribe = False
-                cfg.subscribe_dlg_event = True
-                buddy = BLFBuddyHandler(self, uri)
-                buddy.create(acc, cfg)
-                with self._lock:
-                    self._blf_buddies.append(buddy)
-                if self.on_log:
-                    self.on_log("BLF: subscribed to %s" % uri)
-            except Exception as err:
-                if self.on_log:
-                    self.on_log("BLF: subscribe failed for %s: %s" % (uri, err))
+        try:
+            with self._lock:
+                self._blf_buddies.clear()
+                if not self._accounts:
+                    return
+                acc, acc_config = list(self._accounts.values())[0]
+                acc_uri = (acc_config.get("uri") or "").strip()
+            # Domain for normalizing BLF URIs so SUBSCRIBE goes to proxy (sip:998@domain), not host "998"
+            domain = None
+            if acc_uri and "@" in acc_uri:
+                domain = acc_uri.split("@", 1)[1].split(":", 1)[0]
+            scheme = "sips" if acc_config.get("use_tls") else "sip"
+            entries = list(entries) if entries else []
+            for e in entries:
+                uri = (e.get("uri") or "").strip()
+                if not uri:
+                    continue
+                if not uri.startswith("sip"):
+                    uri = "sip:" + uri
+                # If URI has no @, send SUBSCRIBE to proxy (ext@domain) so server receives it
+                if domain and "@" not in uri:
+                    user = uri.replace("sips:", "").replace("sip:", "").strip()
+                    uri = "%s:%s@%s" % (scheme, user, domain)
+                try:
+                    cfg = pj.BuddyConfig()
+                    cfg.uri = uri
+                    cfg.subscribe = False
+                    cfg.subscribe_dlg_event = True
+                    if BLFBuddyHandler is None:
+                        raise RuntimeError("blf module not available")
+                    buddy = BLFBuddyHandler(self, e.get("uri") or uri)
+                    buddy.create(acc, cfg)
+                    with self._lock:
+                        self._blf_buddies.append(buddy)
+                    if self.on_log:
+                        try:
+                            self.on_log("BLF: subscribed to %s" % uri)
+                        except Exception:
+                            pass
+                except Exception as err:
+                    if self.on_log:
+                        try:
+                            self.on_log("BLF: subscribe failed for %s: %s" % (uri, err))
+                        except Exception:
+                            pass
+                    sys.stderr.write("BLF subscribe error for %s: %s\n" % (uri, err))
+        except Exception as e:
+            sys.stderr.write("BLF set_blf error: %s\n" % (e,))
 
     def make_call(self, to_uri):
         """Place outgoing call from current account. to_uri e.g. sip:user@host.

@@ -5,7 +5,7 @@ Compact Linux SIP client (User-Agent: NixSIP/1.0). Tested on Linux Mint. Multi-a
 ## Features
 
 - **Multiple accounts** — Add several SIP accounts and switch from the dropdown. Switching accounts unregisters the previous one and registers the selected account.
-- **Speed dials & BLF** — Menu → **Edit speed dials & BLF…** to add/edit speed-dial entries (label + number) and BLF entries (label + URI). Speed-dial buttons and BLF row appear on the main window.
+- **Speed dials & BLF** — Menu → **Edit speed dials & BLF…** to add speed-dial and BLF entries. BLF shows a lamp per extension: green = idle, red = in call (see [BLF](#blf-busy-lamp-field) below).
 - **TLS** — Use SIPS (port 5061) per account; optional TLS per account.
 - **Call controls** — Dialpad (scales to window width), Call, Hang up, Answer, Reject, Mute, Hold, Transfer (unattended and attended), Merge (add call for three-way+).
 - **In-call display** — During an active call the app shows a **call timer** (M:SS), **latency** (RTT in ms from RTCP), and an estimated **MOS** (1–5) derived from RTT and packet loss.
@@ -75,16 +75,19 @@ If you use the local build only (or see "pjsua2 not installed"):
 5. **Three-way (Add call)** — Be on a call, click **Add call**, enter the second number. When the second party answers, both legs are active and the app mixes audio (via pjproject). The "current" call (used for Hold, Transfer, DTMF) stays the first leg; Hang up ends the current leg only.
 6. Dialpad scales with window width and keeps button aspect ratio; use it for DTMF during a call.
 7. **In-call stats** — While a call is connected, a line under the status shows call duration (e.g. 1:23), latency in ms, and MOS (Mean Opinion Score) quality estimate. Values appear after RTP is flowing; "—" is shown until data is available.
-8. **Speed dials & BLF** — Each account has its own speed dials and BLF list. Use **Menu → Edit speed dials & BLF…** to add/remove entries for the currently selected account. Speed-dial buttons and BLF row update when you switch accounts. For BLF, enter the **full SIP URI** of the extension to monitor (e.g. `sip:100@pbx.example.com`).
-
+8. **Speed dials & BLF** — Each account has its own list. Add BLF entries with label + URI (e.g. `998` or `sip:998@pbx.example.com`). Click a BLF row to call that extension.
 9. **Call history** — **Menu → Call history…** opens a list of the last 20 calls (↑ outgoing, ↓ incoming). Click a row to dial that number. Shown as "No call history" when empty.
 
 **Config files:** `~/.config/sipclient/accounts.json`, `audio.json`, `prefs.json` (last-used account). Speed dials and BLF are stored per account as `speeddials_<key>.json` and `blf_<key>.json` (one key per account). Call history is in `call_history.json`.
 
+## BLF (Busy Lamp Field)
+
+BLF subscribes to dialog state for each configured extension. The lamp shows **green** when idle and **red** when the extension is in a call. State is derived from NOTIFY bodies in `~/.config/sipclient/sip_debug.log` (the pjsua2 Python callback does not expose the NOTIFY body in this build). A short delay and a periodic refresh from the log keep the lamp in sync when calls start and end. Requires SIP debug logging (on by default).
+
 ## Debugging
 
-- **Show debug log** — Check "Show debug log" in the log area to show or hide the panel; when off, log messages are discarded.
-- **SIP/RTP trace** — Full SIP and RTP trace is written to `~/.config/sipclient/sip_debug.log`. Use **Menu → Open SIP debug log…** to open it in your default text editor. Use this to debug registration, calls, SUBSCRIBE/NOTIFY (e.g. BLF), and message flow.
+- **Show debug log** — Check "Show debug log" in the log area to show or hide the in-app log panel.
+- **SIP/RTP trace** — Written to `~/.config/sipclient/sip_debug.log`. Use **Menu → Open SIP debug log…** to open it. Used for registration, calls, BLF NOTIFYs, and message flow.
 
 ## SIPS and 480 SIPS Required
 
